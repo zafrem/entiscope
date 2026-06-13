@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local weight bundles / fine-tune outputs
+.demo_out/
+*.onnx
+*.safetensors
+
+# OS
+.DS_Store

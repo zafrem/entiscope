@@ -1,0 +1,229 @@
+"""Public Python API (SRS FR-2.7).
+
+    from entiscope import Entiscope            # or: from entiscope_ko import Entiscope
+
+    # one language (explicit, or the sole one installed)
+    engine = Entiscope.from_pretrained(lang="ko")
+    result = engine.redact("홍길동의 전화번호는 010-1234-5678")
+    result.masked_text      # "<PER>의 전화번호는 <PHONE>"
+
+    # multiple languages installed → route each text automatically
+    auto = Entiscope.auto()
+    auto.redact("홍길동 010-1234-5678")          # → Korean engine
+    auto.redact("John Smith 555-123-4567")       # → English engine
+
+The engine is a two-stage hybrid pipeline (SRS §3.4): a regex filter (always
+available) plus an optional ONNX NER stage. ``regex_only=True`` runs the engine
+with no model weights — useful offline and for structurally-obvious PII.
+
+Language-specific data (regex rules, entity config, default weights repo) comes
+from an installed language plugin discovered via the ``entiscope.languages``
+entry-point group; the core hardcodes nothing language-specific.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Union
+
+from ._core.bioes import Span
+from ._core.detect import detect_language
+from ._core.download import resolve_weights
+from ._core.pipeline import assemble, merge_union
+from ._core.plugins import LanguagePlugin, installed_languages, resolve_plugin
+from ._core.regex_filter import RegexFilter
+from ._core.schema import RedactionResult
+from ._core.transitions import CATEGORIES, resolve_operating_point
+
+OperatingPoint = Union[str, Sequence[float], dict, None]
+
+
+def _regex_rules_path(plugin: LanguagePlugin) -> Path:
+    """Locate the active language's regex ruleset (env override wins)."""
+    env = os.environ.get("ENTISCOPE_REGEX_RULES")
+    if env:
+        return Path(env)
+    return plugin.regex_rules_path()
+
+
+class Entiscope:
+    """Two-stage PII redaction engine for a single language."""
+
+    def __init__(
+        self,
+        regex_filter: RegexFilter,
+        runtime=None,
+        operating_point: OperatingPoint = "balanced",
+    ) -> None:
+        self._regex = regex_filter
+        self._runtime = runtime
+        self._operating_point = operating_point
+
+    # -- construction -------------------------------------------------------
+    @classmethod
+    def from_pretrained(
+        cls,
+        operating_point: OperatingPoint = "balanced",
+        *,
+        lang: Optional[str] = None,
+        repo_id: Optional[str] = None,
+        revision: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        regex_rules: Optional[str] = None,
+        providers: Optional[Sequence[str]] = None,
+        regex_only: bool = False,
+    ) -> "Entiscope":
+        """Load the engine for one language, fetching ONNX weights on first use.
+
+        ``lang`` selects the language plugin; if omitted, the sole installed
+        plugin is used (raises if several are installed — pass ``lang`` or use
+        :meth:`auto`). Pass ``regex_only=True`` to skip the NER stage (no weights
+        required). ``cache_dir`` pointing at a local bundle enables offline use.
+        """
+        plugin = resolve_plugin(lang)
+        rules_path = regex_rules or _regex_rules_path(plugin)
+        regex = RegexFilter.from_yaml(rules_path)
+
+        runtime = None
+        if not regex_only:
+            from ._core.runtime import NerRuntime
+
+            repo = repo_id or plugin.default_repo
+            bundle = resolve_weights(repo_id=repo, revision=revision, cache_dir=cache_dir)
+            runtime = NerRuntime(bundle, providers=providers)
+        return cls(regex, runtime, operating_point)
+
+    @classmethod
+    def regex_only(
+        cls, *, lang: Optional[str] = None, regex_rules: Optional[str] = None
+    ) -> "Entiscope":
+        """Convenience constructor for a Stage-1-only engine (no weights)."""
+        return cls.from_pretrained(regex_only=True, lang=lang, regex_rules=regex_rules)
+
+    @classmethod
+    def auto(
+        cls,
+        operating_point: OperatingPoint = "balanced",
+        *,
+        cache_dir: Optional[str] = None,
+        providers: Optional[Sequence[str]] = None,
+        regex_only: bool = False,
+    ) -> "AutoEntiscope":
+        """Return a dispatcher that routes each text to its language engine.
+
+        Languages are detected per text (Unicode-script heuristic) and restricted
+        to the installed plugins. Per-language engines are built lazily and cached.
+        """
+        return AutoEntiscope(
+            operating_point=operating_point,
+            cache_dir=cache_dir,
+            providers=providers,
+            regex_only=regex_only,
+        )
+
+    # -- inference ----------------------------------------------------------
+    def _effective_biases(self, operating_point: OperatingPoint) -> List[float]:
+        """Learned baseline biases shifted by the operating-point offset (FR-2.5)."""
+        offset = resolve_operating_point(
+            operating_point if operating_point is not None else self._operating_point
+        )
+        base = self._runtime.default_biases if self._runtime else [0.0] * len(CATEGORIES)
+        return [b + o for b, o in zip(base, offset)]
+
+    def redact(
+        self,
+        text: str,
+        entity_types: Optional[Iterable[str]] = None,
+        output_mode: str = "typed",
+        operating_point: OperatingPoint = None,
+    ) -> RedactionResult:
+        """Detect and mask PII in a single string (FR-2.2)."""
+        regex_spans: List[Span] = self._regex.find(text)
+        ner_spans: List[Span] = []
+        mismatch = False
+        if self._runtime is not None:
+            ner_spans, mismatch = self._runtime.predict(text, self._effective_biases(operating_point))
+        merged = merge_union(regex_spans, ner_spans)
+        return assemble(text, merged, output_mode, entity_types, mismatch)
+
+    def batch_redact(
+        self,
+        texts: Sequence[str],
+        entity_types: Optional[Iterable[str]] = None,
+        output_mode: str = "typed",
+        operating_point: OperatingPoint = None,
+    ) -> List[RedactionResult]:
+        return [self.redact(t, entity_types, output_mode, operating_point) for t in texts]
+
+    @property
+    def has_ner(self) -> bool:
+        return self._runtime is not None
+
+
+class AutoEntiscope:
+    """Multi-language dispatcher (see :meth:`Entiscope.auto`).
+
+    Mirrors the :class:`Entiscope` inference surface (``redact`` /
+    ``batch_redact`` / ``has_ner``) and routes each call to a lazily-built,
+    cached per-language engine chosen by :func:`detect_language`.
+    """
+
+    def __init__(
+        self,
+        *,
+        operating_point: OperatingPoint,
+        cache_dir: Optional[str],
+        providers: Optional[Sequence[str]],
+        regex_only: bool,
+    ) -> None:
+        self._available = sorted(installed_languages())
+        if not self._available:
+            raise ValueError(
+                "no entiscope language plugin installed; install one, "
+                "e.g. pip install entiscope-ko"
+            )
+        self._kwargs = dict(
+            operating_point=operating_point,
+            cache_dir=cache_dir,
+            providers=providers,
+            regex_only=regex_only,
+        )
+        self._regex_only = regex_only
+        self._engines: Dict[str, Entiscope] = {}
+
+    @property
+    def available_languages(self) -> List[str]:
+        return list(self._available)
+
+    def _engine_for(self, lang: str) -> Entiscope:
+        if lang not in self._engines:
+            self._engines[lang] = Entiscope.from_pretrained(lang=lang, **self._kwargs)
+        return self._engines[lang]
+
+    def route(self, text: str) -> str:
+        """Return the language code chosen for ``text``."""
+        return detect_language(text, self._available) or self._available[0]
+
+    def redact(
+        self,
+        text: str,
+        entity_types: Optional[Iterable[str]] = None,
+        output_mode: str = "typed",
+        operating_point: OperatingPoint = None,
+    ) -> RedactionResult:
+        return self._engine_for(self.route(text)).redact(
+            text, entity_types, output_mode, operating_point
+        )
+
+    def batch_redact(
+        self,
+        texts: Sequence[str],
+        entity_types: Optional[Iterable[str]] = None,
+        output_mode: str = "typed",
+        operating_point: OperatingPoint = None,
+    ) -> List[RedactionResult]:
+        return [self.redact(t, entity_types, output_mode, operating_point) for t in texts]
+
+    @property
+    def has_ner(self) -> bool:
+        return not self._regex_only

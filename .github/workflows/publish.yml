@@ -1,0 +1,70 @@
+name: Publish entiscope
+
+# Builds the sdist + wheel and publishes to PyPI.
+#   - Publishing a GitHub Release  -> uploads to PyPI.
+#   - Manual run (workflow_dispatch) -> uploads to TestPyPI for a dry run.
+# Auth via API tokens stored as GitHub secrets:
+#   PYPI_API_TOKEN       (pypi.org      -> Account -> API tokens)
+#   TEST_PYPI_API_TOKEN  (test.pypi.org -> Account -> API tokens)
+# Scope each token to the environment below (Settings -> Environments).
+#
+# Publish order is load-bearing: `entiscope` (core) must reach PyPI BEFORE the
+# language packs (entiscope-ko, entiscope-en, …), which depend on it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+      - name: Check metadata
+        run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    # Dry run: manual trigger -> TestPyPI (0.1.0 is immutable once on real PyPI).
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+
+  publish-pypi:
+    # Real release: triggered by publishing a GitHub Release.
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
