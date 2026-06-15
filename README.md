@@ -16,6 +16,15 @@ pip install entiscope-en      # English
 Installing a language pack pulls in this core as a dependency, so you normally never
 `pip install entiscope` directly.
 
+## Why entiscope?
+
+Compared to traditional NER systems from 3-4 years ago, `entiscope` delivers significantly higher precision and robustness by employing several modern architectural advancements:
+
+1. **BIOES Tagging:** Unlike the traditional BIO scheme, we use the BIOES (Begin, Inside, Outside, End, Single) scheme. This allows the model to explicitly learn span boundaries and single-token entities, which is critical for CJK languages where particles often follow PII entities without spaces.
+2. **Constrained Viterbi Decoding:** Instead of making independent per-token decisions, we use a Viterbi decoder with learned transition biases. This ensures that the output sequence is always grammatically valid (e.g., an "Inside" tag can never follow an "Outside" tag), preventing fragmented or "broken" masking results.
+3. **Domain-Adaptive MLM:** Before fine-tuning on PII extraction, we perform additional Masked Language Modeling (MLM) on a large-scale synthetic PII corpus. This "domain adaptation" phase allows the model to internalize the structural characteristics of PII (like API keys, ID numbers, and complex addresses) that are rarely seen in general-purpose datasets like Wikipedia.
+4. **LLM-Augmented Synthesis:** We leverage LLMs and Faker to generate hundreds of thousands of high-fidelity synthetic PII sentences across various registers (formal, conversational, etc.). This massive increase in training variety ensures the model remains robust against novel contexts and diverse writing styles.
+
 ## One command, any combination of languages
 
 The `entiscope` command lives **only** here in the core, so co-installed language
