@@ -48,3 +48,33 @@ def test_distinctive_script_beats_latin():
 @pytest.mark.parametrize("text", ["", "   ", "@@@ ###"])
 def test_sole_available_default(text):
     assert detect_language(text, ["ko"]) == "ko"
+
+
+# -- Simplified vs Traditional Chinese (zh-Hans / zh-Hant) ----------------
+
+ZH = ["zh-Hans", "zh-Hant", "en", "ko"]
+
+
+def test_simplified_routes_zh_hans():
+    assert detect_language("张伟说这个国家很现代", ZH) == "zh-Hans"
+    assert detect_language("广州市浦东新区，电话13812345678", ZH) == "zh-Hans"
+
+
+def test_traditional_routes_zh_hant():
+    assert detect_language("張偉說這個國家很現代", ZH) == "zh-Hant"
+    assert detect_language("臺北市中正區，電話0912345678", ZH) == "zh-Hant"
+
+
+def test_zh_tie_defaults_to_simplified():
+    # Only characters shared by both forms → no signal → default Simplified.
+    assert detect_language("中文", ZH) == "zh-Hans"
+
+
+def test_zh_single_form_installed_wins():
+    # Traditional text but only Simplified installed → Simplified (sole zh form).
+    assert detect_language("張偉", ["zh-Hans", "en"]) == "zh-Hans"
+    assert detect_language("张伟", ["zh-Hant", "en"]) == "zh-Hant"
+
+
+def test_legacy_zh_still_supported():
+    assert detect_language("张伟在北京", ["zh", "en"]) == "zh"
