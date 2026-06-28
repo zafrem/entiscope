@@ -23,6 +23,7 @@ entry-point group; the core hardcodes nothing language-specific.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
@@ -166,6 +167,12 @@ class AutoEntiscope:
     Mirrors the :class:`Entiscope` inference surface (``redact`` /
     ``batch_redact`` / ``has_ner``) and routes each call to a lazily-built,
     cached per-language engine chosen by :func:`detect_language`.
+
+    **Thread-safety:** per-language engine construction is guarded by a lock, so
+    concurrent callers (e.g. a multi-threaded web server) never build or download
+    the same engine twice. Once built, ONNX Runtime sessions are safe for
+    concurrent inference. Call :meth:`preload` at startup to build engines
+    eagerly and avoid a first-request latency spike.
     """
 
     def __init__(
@@ -190,15 +197,37 @@ class AutoEntiscope:
         )
         self._regex_only = regex_only
         self._engines: Dict[str, Entiscope] = {}
+        self._lock = threading.Lock()
 
     @property
     def available_languages(self) -> List[str]:
         return list(self._available)
 
     def _engine_for(self, lang: str) -> Entiscope:
-        if lang not in self._engines:
-            self._engines[lang] = Entiscope.from_pretrained(lang=lang, **self._kwargs)
-        return self._engines[lang]
+        # Fast path: already built (dict reads are atomic under the GIL).
+        engine = self._engines.get(lang)
+        if engine is not None:
+            return engine
+        # Slow path: build under lock with a double-check so concurrent callers
+        # for the same language share one engine (and one weights download).
+        with self._lock:
+            engine = self._engines.get(lang)
+            if engine is None:
+                engine = Entiscope.from_pretrained(lang=lang, **self._kwargs)
+                self._engines[lang] = engine
+            return engine
+
+    def preload(self, langs: Optional[Iterable[str]] = None) -> "AutoEntiscope":
+        """Eagerly build (and cache) engines so the first request is warm.
+
+        Builds every installed language by default, or just ``langs``. Returns
+        ``self`` for chaining, e.g. ``engine = Entiscope.auto().preload()``.
+        Ideal at web-server startup: fail fast on missing weights and avoid a
+        cold-start spike on the first redact call.
+        """
+        for lang in (langs if langs is not None else self._available):
+            self._engine_for(lang)
+        return self
 
     def route(self, text: str) -> str:
         """Return the language code chosen for ``text``."""
